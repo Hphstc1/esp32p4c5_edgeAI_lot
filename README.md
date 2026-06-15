@@ -1,121 +1,84 @@
-# p4_face_stream
+# esp32p4c5_edgeAI_lot
 
-Face recognition + real-time MJPEG streaming on the **WT99P4C5-S1** (ESP32-P4 + ESP32-C5) running ESP-IDF v5.5.
+ESP32-P4 人脸识别 + MJPEG 实时推流，基于 **WT99P4C5-S1** 开发板，ESP-IDF v5.4.4。
 
-This project glues together two existing art pieces that already live in this workspace:
+## 功能
 
-| From                        | Reused                                                                |
-|-----------------------------|-----------------------------------------------------------------------|
-| `p4_camera_stream/`         | Working MIPI-CSI capture (OV5647), JPEG encoder, BSP, Ethernet init   |
-| `esp-who/examples/human_face_recognition` | Underlying `espressif/human_face_recognition` model (the same one esp-who's `WhoRecognition` wraps in C++) |
+1. OV5647 摄像头 1280×960 RGB565 采集
+2. 人脸检测 + 人脸识别（MNLP + MobileFaceNet，ESP-DL 量化）
+3. 检测框/姓名标注叠加
+4. 硬件 JPEG 编码 → HTTP MJPEG 推流（port 8080）
+5. JSON API：录入 / 删除 / 设备信息 / 识别事件
+6. SPIFFS 人脸库（重启不丢失）
 
-The result is a single firmware image that:
+## 硬件
 
-1. Captures OV5647 frames at QVGA / WQVGA in RGB565.
-2. Runs **face detection** + **face recognition** on every Nth frame (the model is `MNLP` + `MobileFaceNet` quantized for ESP-DL).
-3. Draws coloured boxes + name labels directly into the RGB565 buffer.
-4. JPEG-encodes the annotated frame and pushes it into a small ring buffer.
-5. Serves the latest JPEG over **HTTP MJPEG** (`multipart/x-mixed-replace`) plus a small **JSON control API** for enroll / delete / event polling.
+- **芯片：** ESP32-P4，双核 RISC-V @ 400MHz，32 MB PSRAM
+- **开发板：** WT99P4C5-S1
+- **摄像头：** OV5647 MIPI-CSI
+- **网络：** 10/100M 以太网，静态 IP `192.168.1.200`
 
-## Endpoints (port 8080)
-
-| Method | Path           | Purpose                                                       |
-|-------:|----------------|---------------------------------------------------------------|
-| GET    | `/`            | Dashboard HTML with embedded `<img src=/stream>` and live event panel |
-| GET    | `/stream`      | Multipart MJPEG — annotated live view                          |
-| GET    | `/api/info`    | JSON device info, FPS, enrolled count                          |
-| GET    | `/api/events`  | JSON latest recognition event (id, name, similarity, bbox, ts) |
-| POST   | `/api/enroll`  | Trigger one-shot enrollment on the next frame                  |
-| POST   | `/api/delete`  | Drop the most recently enrolled face                           |
-
-`face.db` (the face embedding database) lives in the on-board SPIFFS partition (`/spiffs/face.db`), so enrollments survive reboot.
-
-## Hardware
-
-Per the **WT99P4C5-S1 开发板使用指南 v1.2**:
-
-* ESP32-P4, dual-core RISC-V @ 360 MHz, 32 MB PSRAM
-* ESP32-C5-WROOM-1 companion for 2.4 / 5 GHz Wi-Fi 6 (not used by this firmware but available)
-* OV5647 sensor over MIPI-CSI
-* 7″ MIPI-DSI LCD (not driven — we stream over Ethernet)
-* 10/100 M Ethernet PHY
-* ES8311 audio codec (unused)
-
-The MIPI-CSI pin map and Ethernet GPIOs are pinned in `sdkconfig.defaults` and `app_main.cpp`. Ethernet is brought up via `bsp_eth_init()` and assigned a static IP `192.168.1.200/24` so the demo URL is stable.
-
-## How the code is organised
+## 目录结构
 
 ```
-p4_face_stream/
-├── CMakeLists.txt           # top-level; EXTRA_COMPONENT_DIRS points to the
-│                            # shared BSP in p4_camera_stream/components
-├── sdkconfig.defaults        # chip + camera + ethernet defaults
-├── partitions.csv            # adds a 1 MB SPIFFS partition for face.db
-├── README.md
+esp32p4c5_edgeAI_lot/
+├── CMakeLists.txt              # 顶层 CMake
+├── sdkconfig                   # Kconfig 配置
+├── sdkconfig.defaults           # 默认配置覆盖
+├── partitions.csv               # Flash 分区表
+├── .gitignore                   # 不上传的文件列表
+├── scripts/
+│   ├── build_now.bat            # CMD 编译脚本
+│   ├── build_p4.bat             # 编译脚本（旧）
+│   └── flash_p4.bat             # 烧录脚本
+├── components/                  # 自带的 BSP 组件（不依赖外部）
+│   ├── wt99p4c5_s1_board/       # 板卡 BSP
+│   └── bsp_extra/               # BSP 扩展
 └── main/
     ├── CMakeLists.txt
-    ├── idf_component.yml    # esp_video, esp_cam_sensor, esp_jpeg,
-    │                        # human_face_recognition, human_face_detect
-    ├── app_main.cpp          # orchestration: NVS, ethernet, camera, http
-    ├── app_video.{c,h}       # V4L2 capture loop (OV5647, RGB565)
-    ├── face_ai.{hpp,cpp}     # HumanFaceDetect + HumanFaceRecognizer wrapper
-    ├── jpeg_annotate.{hpp,cpp}  # box / 5x7-font label drawing on RGB565
-    └── http_server.{hpp,cpp}    # blocking-friendly HTTP/1.1 + MJPEG
+    ├── idf_component.yml        # 组件依赖声明
+    ├── app_main.cpp             # 主入口：初始化 + 主循环
+    ├── app_video.c / .h         # V4L2 摄像头
+    ├── face_ai.cpp / .hpp       # 人脸检测+识别
+    ├── http_server.cpp / .hpp   # HTTP + MJPEG 推流
+    ├── jpeg_annotate.cpp / .hpp # 画框标注
+    └── pest_ai.cpp / .hpp       # 害虫检测（未编译进固件）
 ```
 
-The C++ portions are limited to the model wrapper and HTTP server; everything else is plain C and follows the coding style of `p4_camera_stream/main/`.
+## 编译
 
-## Build & flash
+打开 **Windows CMD**（不是 Git Bash）：
 
-```sh
-# from the project root, with ESP-IDF 5.5 exported
-cd D:/esp32/p4_face_stream
-idf.py set-target esp32p4
-idf.py build
-idf.py -p COMx flash monitor
+```cmd
+D:\esp32\esp32p4c5_edgeAI_lot\scripts\build_now.bat
 ```
 
-After boot the serial log will print:
+## 烧录
 
-```
-...
-Ethernet up, IP 192.168.1.200
-SPIFFS: total=1048576 used=0
-FaceAi ready, db=/spiffs/face.db, enrolled=0
-http_srv: listening on :8080 (max=4)
-Streaming at http://192.168.1.200:8080/
+```cmd
+D:\esp32\esp32p4c5_edgeAI_lot\scripts\flash_p4.bat COM7
 ```
 
-Open a browser to <http://192.168.1.200:8080/>. The first few frames are empty while the model warms up; once `s_frame_idx > 5` boxes start showing up.
+## HTTP API（port 8080）
 
-## Demo flow
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/` | 仪表盘 |
+| GET | `/stream` | MJPEG 视频流（带人脸框） |
+| GET | `/api/info` | 设备信息 / FPS / 录入数 |
+| GET | `/api/events` | 最新识别事件 |
+| POST | `/api/enroll` | 录入人脸 |
+| POST | `/api/delete` | 删除最近录入的人脸 |
 
-1. Open the dashboard in a browser.
-2. Click **Enroll** → stand in front of the camera for ~2 s. The next face detection adds a new entry to the face database. The page polls `/api/info` and shows the new enrollment count.
-3. Click **Enroll** again with a different person to add id:2, id:3, …
-4. Walk around; the stream shows green boxes for recognized faces and orange boxes for strangers.
-5. Click **Delete last** to roll back the most recent enrollment.
-6. Power-cycle the board — `/api/info` will still report the saved enrollments because the database lives in SPIFFS.
+## 启动日志
 
-## Performance notes
+```
+ESP-ROM:esp32p4-20240710
+I (6721) app_video: allocated 4 buffers
+I (6743) http: listening on :8080
+I (6748) p4fs: Streaming at http://192.168.1.200:8080/
+I (6748) p4fs: startup: free_heap=20057980 psram_free=19617548
+I (11788) p4fs: alive frames=45 fps=9.0 enrolled=0
+```
 
-| Stage                | Typical cost on P4 @ 360 MHz             |
-|----------------------|------------------------------------------|
-| V4L2 capture (QVGA)  | DMA, free during CPU work                |
-| Face detection       | ~80–110 ms / frame (quantized MNLP)      |
-| Face recognition     | ~30–50 ms / face                         |
-| Annotation (boxes)   | < 1 ms                                  |
-| JPEG encode (QVGA)   | ~5–10 ms (hardware)                      |
-| HTTP MJPEG push      | dominated by link speed on Ethernet      |
-
-Because detection is the hot loop, we run the model on every 3rd frame by default (`kProcessEveryN` in `app_main.cpp`) to keep the effective stream ≥ 10 FPS at QVGA while still catching every face. Boxes are still drawn on every frame, so the visual stream stays smooth.
-
-## Project context (TDP-Net)
-
-This project is the **AI 视觉节点 (P4Sight)** firmware deliverable for the TDP-Net system described in `TDP-Net 开发计划书 v8.0.docx`. The PRD there calls for:
-
-* P4 NPU human detection < 100 ms ✅
-* MJPEG live push over the WT99P4C5-S1 ✅
-* ESP-NOW control plane / Wi-Fi 6 data plane — *out of scope of this image; this firmware focuses on the per-node capture + recognition + HTTP preview.*
-
-`TDP-Net` itself (TDMA mesh, AES-GCM, multi-hop routing) lives in the team repo and is wired in around this image.
+浏览器打开 `http://192.168.1.200:8080/`（PC 以太网口需设为同一网段，如 `192.168.1.100`）。
