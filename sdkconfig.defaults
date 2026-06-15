@@ -1,0 +1,61 @@
+# --- Board / chip ---
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# --- PSRAM (32 MB on the WT0132P4-A1 core board) ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+# USE_MALLOC (not USE_CAPS_ALLOC) is required so that C++ `new` (used inside
+# the human_face_detect / human_face_recognition model objects) can return
+# PSRAM pointers. With USE_CAPS_ALLOC, `new` is restricted to internal RAM
+# (~500 KB) and the 2.4 MB RGB565 frame + model buffers blow the heap and
+# throw std::bad_alloc on the first frame.
+CONFIG_SPIRAM_USE_MALLOC=y
+# Don't reserve any internal memory for "must-be-internal" allocations;
+# everything model-related lives in PSRAM.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+# Small allocations (<=4 KB) still prefer internal RAM for speed; everything
+# larger goes to PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# --- Camera: OV5647 over MIPI-CSI, matches p4_camera_stream ---
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_MIPI_RAW10_1280x960_BINNING_45FPS=y
+CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=n
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+
+# --- Ethernet (WT99P4C5-S1 on-board 100M PHY) ---
+CONFIG_ETH_ENABLED=y
+CONFIG_ETH_USE_ESP32_EMAC=y
+
+# --- lwIP sockets (HTTP server) ---
+CONFIG_LWIP_SOCKET=y
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
+
+# --- Skip LVGL / display; this app streams over HTTP, not on the LCD ---
+CONFIG_BSP_CONFIG_NO_GRAPHIC_LIB=y
+
+# --- BSP I2C + Ethernet (override defaults to match WT99P4C5-S1) ---
+CONFIG_BSP_I2C_NUM=0
+CONFIG_BSP_ETH_PHY_ADDR=1
+CONFIG_BSP_ETH_PHY_RST_GPIO=51
+CONFIG_BSP_ETH_MDC_GPIO=31
+CONFIG_BSP_ETH_MDIO_GPIO=52
+
+# --- Build tuning ---
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_VFS_MAX_COUNT=15
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# --- Model storage ---
+# Pull in a 4 MB storage partition so we can keep a face database across boots.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_BSP_SPIFFS_FORMAT_ON_MOUNT_FAIL=y

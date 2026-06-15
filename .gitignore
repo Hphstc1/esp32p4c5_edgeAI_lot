@@ -1,0 +1,23 @@
+# Build output
+build/
+
+# Managed components (auto-downloaded by ESP-IDF component manager)
+managed_components/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Eclipse CDT (from BSP components)
+.cproject
+.project
+
+# OS junk
+Thumbs.db
+Desktop.ini
+
+# OMC state files
+.omc/

@@ -1,0 +1,27 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "app_video.c"
+        "face_ai.cpp"
+        "jpeg_annotate.cpp"
+        "http_server.cpp"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        esp_eth
+        esp_netif
+        esp_event
+        nvs_flash
+        esp_driver_jpeg
+        esp_lcd
+        fatfs
+        spiffs
+        wt99p4c5_s1_board
+        bsp_extra
+        espressif__esp_video
+        espressif__esp_cam_sensor
+        espressif__esp_sccb_intf
+        espressif__esp_jpeg
+        espressif__human_face_recognition
+        espressif__human_face_detect
+)

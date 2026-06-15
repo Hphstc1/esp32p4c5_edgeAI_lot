@@ -1,0 +1,7 @@
+dependencies:
+  espressif/esp_video: "0.8.*"
+  espressif/esp_cam_sensor: "0.9.*"
+  espressif/esp_sccb_intf: "0.0.*"
+  espressif/esp_jpeg: "1.*"
+  espressif/human_face_recognition: "*"
+  espressif/human_face_detect: "*"
