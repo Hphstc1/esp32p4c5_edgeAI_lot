@@ -21,3 +21,4 @@ Desktop.ini
 
 # OMC state files
 .omc/
+gitToken.txt
