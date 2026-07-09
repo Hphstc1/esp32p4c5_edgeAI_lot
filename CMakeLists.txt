@@ -6,6 +6,7 @@ cmake_minimum_required(VERSION 3.16)
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/components/wt99p4c5_s1_board"
     "${CMAKE_CURRENT_SOURCE_DIR}/components/bsp_extra"
+    "${CMAKE_CURRENT_SOURCE_DIR}/components/c5_bridge"
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

@@ -2,12 +2,14 @@
 
 ESP32-P4 人脸识别 + MJPEG 实时推流，基于 **WT99P4C5-S1** 开发板，ESP-IDF v5.4.4。
 
+> **架构 v2.0**: 本固件仅部署人脸识别模型。害虫检测已迁移至 PC 端 [PestYOLO](../PestYOLO/)，通过 MQTT 桥接视频帧流。
+
 ## 功能
 
 1. OV5647 摄像头 1280×960 RGB565 采集
-2. 人脸检测 + 人脸识别（MNLP + MobileFaceNet，ESP-DL 量化）
-3. 检测框/姓名标注叠加
-4. 硬件 JPEG 编码 → HTTP MJPEG 推流（port 8080）
+2. 人脸检测 + 人脸识别（MSR + MNP + MobileFaceNet，ESP-DL 量化）
+3. 检测框/姓名标注叠加 (5×7 像素字体, 零依赖)
+4. 硬件 JPEG 编码 → HTTP MJPEG 推流（port 8080, ~9 FPS）
 5. JSON API：录入 / 删除 / 设备信息 / 识别事件
 6. SPIFFS 人脸库（重启不丢失）
 
@@ -30,8 +32,8 @@ esp32p4c5_edgeAI_lot/
 ├── scripts/
 │   ├── build_now.bat            # CMD 编译脚本
 │   ├── build_p4.bat             # 编译脚本（旧）
-│   └── flash_p4.bat             # 烧录脚本
-├── components/                  # 自带的 BSP 组件（不依赖外部）
+│   └── flash_p4.bat             # 烧录脚本（仅固件）
+├── components/                  # 自带的 BSP 组件
 │   ├── wt99p4c5_s1_board/       # 板卡 BSP
 │   └── bsp_extra/               # BSP 扩展
 └── main/
@@ -42,7 +44,7 @@ esp32p4c5_edgeAI_lot/
     ├── face_ai.cpp / .hpp       # 人脸检测+识别
     ├── http_server.cpp / .hpp   # HTTP + MJPEG 推流
     ├── jpeg_annotate.cpp / .hpp # 画框标注
-    └── pest_ai.cpp / .hpp       # 害虫检测（未编译进固件）
+    └── pest_ai.cpp / .hpp       # ⚠️ 已废弃 — 害虫检测迁移至 PC 端
 ```
 
 ## 编译
@@ -50,13 +52,13 @@ esp32p4c5_edgeAI_lot/
 打开 **Windows CMD**（不是 Git Bash）：
 
 ```cmd
-D:\esp32\esp32p4c5_edgeAI_lot\scripts\build_now.bat
+D:\esp32\tmp\build_now.bat
 ```
 
 ## 烧录
 
 ```cmd
-D:\esp32\esp32p4c5_edgeAI_lot\scripts\flash_p4.bat COM7
+D:\esp32\tmp\flash_p4.bat COM7
 ```
 
 ## HTTP API（port 8080）
@@ -82,3 +84,15 @@ I (11788) p4fs: alive frames=45 fps=9.0 enrolled=0
 ```
 
 浏览器打开 `http://192.168.1.200:8080/`（PC 以太网口需设为同一网段，如 `192.168.1.100`）。
+
+## 与 PC 端害虫检测配合
+
+本固件的 MJPEG 帧流可供 PC 端 [PestYOLO](../PestYOLO/) 消费：
+
+```
+ESP32-P4 (:8080 MJPEG) ──► MQTT publish JPEG ──► PC PestYOLO (:7860)
+                                                       │
+                               YOLOv8 102类害虫检测 + Web UI
+```
+
+详见 [PestYOLO README](../PestYOLO/README.MD)。

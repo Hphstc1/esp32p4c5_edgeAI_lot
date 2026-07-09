@@ -168,10 +168,8 @@ bool HttpServer::serve_stream(int fd) {
         }
         last_seen = cur;
         // Snapshot the most recent frame (head-1).
-        int idx;
         if (ring_fill_ == 0) continue;
-        if (ring_fill_ < ring_cap_) idx = (ring_head_ - 1 + ring_fill_) % ring_cap_;
-        else                         idx = (ring_head_ - 1 + ring_cap_) % ring_cap_;
+        int idx = (ring_head_ - 1 + ring_cap_) % ring_cap_;
         const JpegFrame &f = ring_[idx];
         if (f.data.empty()) continue;
 

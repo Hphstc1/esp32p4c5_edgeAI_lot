@@ -114,9 +114,15 @@ int app_video_open(char *dev, video_fmt_t init_fmt)
              (uint32_t)default_format.fmt.pix.sizeimage,
              (unsigned)default_format.fmt.pix.colorspace);
 
+    /* Use sensor native resolution — the MIPI-CSI driver does NOT
+     * support changing width/height via S_FMT (csi_video_set_format
+     * rejects any mismatched resolution).  Bandwidth is managed by
+     * the 5 FPS frame-rate limiter and 4-bit SDIO (~5 MB/s actual). */
     s_cam.camera_buf_hes = default_format.fmt.pix.width;
     s_cam.camera_buf_ves = default_format.fmt.pix.height;
 
+    /* Pixel format change (e.g. to YUV): allowed with ISP enabled;
+     * skip when it already matches the sensor default. */
     if (default_format.fmt.pix.pixelformat != init_fmt) {
         struct v4l2_format format = {
             .type = type,
@@ -125,15 +131,12 @@ int app_video_open(char *dev, video_fmt_t init_fmt)
             .fmt.pix.pixelformat = init_fmt,
         };
         if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
-            ESP_LOGE(TAG, "S_FMT failed");
+            ESP_LOGE(TAG, "S_FMT (pixfmt change) failed");
             goto exit_0;
         }
-        ESP_LOGI(TAG, "forced RGB565 %" PRIu32 "x%" PRIu32 " (was 0x%" PRIx32 ")",
-                 format.fmt.pix.width, format.fmt.pix.height,
-                 (uint32_t)default_format.fmt.pix.pixelformat);
-    } else {
-        ESP_LOGI(TAG, "default format already matches requested pixfmt=0x%" PRIx32,
-                 (uint32_t)default_format.fmt.pix.pixelformat);
+        ESP_LOGI(TAG, "pixfmt changed to 0x%" PRIx32 " (got %" PRIu32 "x%" PRIu32 ")",
+                 (uint32_t)format.fmt.pix.pixelformat,
+                 format.fmt.pix.width, format.fmt.pix.height);
     }
     return fd;
 

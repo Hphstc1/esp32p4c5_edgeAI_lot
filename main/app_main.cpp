@@ -1,24 +1,32 @@
 /*
  * p4_face_stream: face recognition + MJPEG streaming on the WT99P4C5-S1.
  *
- * Wiring
+ * Data flow:
  *   OV5647 (MIPI-CSI)  ──►  V4L2 RGB565 frames  ──►  FaceAi (every Nth frame)
  *                                              \─►  draw::annotate_faces
  *                                              \─►  jpeg_encoder
- *                                              \─►  HttpServer.push_jpeg
- *                          Ethernet  ◄──  static IP 192.168.1.200  ◄──  BSP
+ *                                              \─►  WiFiTcpStreamer.push_jpeg
+ *                                                   │ C5 SDIO
+ *                                                   │  AT+CIPSEND
+ *                                                   ▼
+ *                                              C5 WiFi AP ──► PC Browser
+ *                         (Ethernet disabled by default, toggle via API)
  *
- * Endpoints (port 8080)
- *   GET  /            dashboard HTML
- *   GET  /stream      multipart MJPEG with face boxes drawn
- *   GET  /api/info    device / FPS / enrollment JSON
- *   GET  /api/events  latest recognition event JSON
- *   POST /api/enroll  trigger one-shot enrollment on next frame
- *   POST /api/delete  drop the last enrolled face
+ * WiFi AP: SSID "P4-FaceStream", password "12345678", IP 192.168.4.1
+ *
+ * Endpoints (port 8080, via WiFi TCP / C5 SDIO)
+ *   GET  /              dashboard HTML
+ *   GET  /stream        multipart MJPEG with face boxes drawn
+ *   GET  /api/info      device / FPS / enrollment JSON
+ *   GET  /api/events    latest recognition event JSON
+ *   POST /api/enroll    trigger one-shot enrollment on next frame
+ *   POST /api/delete    drop the last enrolled face
+ *   POST /api/ethernet  {"enable":true} to turn on Ethernet HTTP server
  */
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -40,6 +48,9 @@
 #include "face_ai.hpp"
 #include "jpeg_annotate.hpp"
 #include "http_server.hpp"
+#include "c5_bridge.h"
+#include "wifi_tcp_stream.hpp"
+#include "stream_switch.h"
 
 static const char *TAG = "p4fs";
 
@@ -50,12 +61,13 @@ std::atomic<int>     g_last_enroll_id{-2};    // -2=no attempt, -1=failed, >=1=e
 uint32_t             g_cam_fps_x100 = 0;      // updated every second
 }
 
-/* ---- Camera + encoder + face-ai handles ----------------------------- */
-static p4fs::FaceAi      *g_face_ai   = nullptr;
-static p4fs::HttpServer  *g_http      = nullptr;
-static jpeg_encoder_handle_t g_jpeg    = nullptr;
-static uint8_t           *g_jpeg_out  = nullptr;
-static size_t             g_jpeg_out_sz = 0;
+/* ---- Camera + encoder + face-ai + WiFi handles ---------------------- */
+static p4fs::FaceAi          *g_face_ai      = nullptr;
+static p4fs::HttpServer      *g_http_eth     = nullptr;
+static p4fs::WiFiTcpStreamer *g_wifi_stream  = nullptr;
+static jpeg_encoder_handle_t  g_jpeg         = nullptr;
+static uint8_t               *g_jpeg_out     = nullptr;
+static size_t                 g_jpeg_out_sz  = 0;
 
 /* Per-frame scratch: a small RGB565 buffer we hand to FaceAi / drawer so
  * the V4L2 mmap buffer stays untouched while we mutate it. */
@@ -107,12 +119,29 @@ extern "C" void app_main(void)
     }
     ESP_LOGI(TAG, "Ethernet up, IP 192.168.1.200");
 
-    /* --- Face AI (loads model from flash) ---------------------- */
+    /* --- Face AI (loads model from flash) — init early so streamer can use it - */
     p4fs::FaceAiConfig fcfg;
     fcfg.db_path = "/spiffs/face.db";
     auto *face_ai = new p4fs::FaceAi(fcfg);
     ESP_ERROR_CHECK(face_ai->init() ? ESP_OK : ESP_FAIL);
     g_face_ai = face_ai;
+
+    /* --- C5 SDIO probe + WiFi streamer ----------------------- */
+    esp_err_t c5_err = c5_sdio_probe();
+    if (c5_err != ESP_OK) {
+        ESP_LOGW(TAG, "C5 SDIO probe failed (0x%x) — continuing without C5", c5_err);
+    } else {
+        /* Start WiFi TCP streamer (AP mode, PC connects directly).
+         * Ethernet is disabled by default (g_ethernet_stream_enabled=false). */
+        auto *wifi = new p4fs::WiFiTcpStreamer("P4-FaceStream", "12345678", 8080);
+        if (wifi->start(face_ai)) {
+            g_wifi_stream = wifi;
+            ESP_LOGI(TAG, "WiFi streamer started — connect to AP 'P4-FaceStream'");
+        } else {
+            ESP_LOGE(TAG, "WiFi streamer failed to start");
+            delete wifi;
+        }
+    }
 
     /* --- Camera + encoder scratch ------------------------------ */
     static const esp_video_init_csi_config_t csi_cfg[] = {{
@@ -146,14 +175,18 @@ extern "C" void app_main(void)
                  (unsigned)app_video_get_buf_size());
     }
 
-    /* --- HTTP server (port 8080) ------------------------------- */
-    p4fs::HttpServerConfig hcfg;
-    hcfg.port = 8080;
-    hcfg.max_clients = 4;
-    hcfg.jpeg_quality = 80;
-    auto *http = new p4fs::HttpServer(hcfg, face_ai);
-    ESP_ERROR_CHECK(http->start() ? ESP_OK : ESP_FAIL);
-    g_http = http;
+    /* --- Ethernet HTTP server (port 8080) — conditional --------- */
+    if (p4fs::g_ethernet_stream_enabled.load()) {
+        p4fs::HttpServerConfig hcfg;
+        hcfg.port = 8080;
+        hcfg.max_clients = 4;
+        hcfg.jpeg_quality = 80;
+        auto *http = new p4fs::HttpServer(hcfg, face_ai);
+        ESP_ERROR_CHECK(http->start() ? ESP_OK : ESP_FAIL);
+        g_http_eth = http;
+    } else {
+        ESP_LOGI(TAG, "Ethernet HTTP server disabled (WiFi path active)");
+    }
 
     /* --- FPS counter task -------------------------------------- */
     static uint32_t s_fc = 0;
@@ -169,6 +202,7 @@ extern "C" void app_main(void)
 
     /* --- Per-frame callback (runs on V4L2 capture task) -------- */
     static int s_frame_idx = 0;
+    static int64_t s_last_frame_us = 0;
     auto frame_cb = [](uint8_t *buf, uint8_t idx, uint32_t w, uint32_t h, size_t len) {
         (void)idx; (void)len;
         s_fc++;
@@ -229,34 +263,73 @@ extern "C" void app_main(void)
             p4fs::draw::annotate_faces(g_scratch_rgb, (int)w, (int)h, hits);
         }
 
-        /* JPEG encode -> push to HTTP ring buffer. */
+        /* Frame rate limiter: cap push to WiFi/Ethernet at ~5 FPS.
+         * Face AI processing above is unaffected by this skip. */
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_frame_us < 200000) {
+            xSemaphoreGive(g_scratch_lock);
+            return;
+        }
+        s_last_frame_us = now;
+
+        /* Dynamic JPEG quality: read SDIO TX congestion (0-100%) and map to
+         * quality 95-40.  Smoothed with a simple recursive filter to avoid
+         * rapid oscillation frame-to-frame. */
+        static uint32_t s_jpeg_quality = 80;
+        uint32_t raw_quality = 80;
+        if (g_wifi_stream) {
+            int congestion = c5_sdio_get_tx_congestion_pct();
+            /* Linear map: 0% -> 95, 50% -> 70, 100% -> 40 */
+            raw_quality = 95 - (congestion * 55 / 100);
+            if (raw_quality < 40) raw_quality = 40;
+            if (raw_quality > 95) raw_quality = 95;
+            /* Smooth: 70% new + 30% old to damp oscillation */
+            uint32_t smoothed = (raw_quality * 7 + s_jpeg_quality * 3) / 10;
+            /* Hysteresis: only apply if delta > 3, prevents jitter */
+            uint32_t diff = (smoothed > s_jpeg_quality) ?
+                            (smoothed - s_jpeg_quality) : (s_jpeg_quality - smoothed);
+            if (diff > 3) {
+                if (diff > 10) {
+                    ESP_LOGI(TAG, "jpeg quality: %lu -> %lu (congestion=%d%%)",
+                             (unsigned long)s_jpeg_quality,
+                             (unsigned long)smoothed, congestion);
+                }
+                s_jpeg_quality = smoothed;
+            }
+        }
+
         jpeg_encode_cfg_t jc = {
             .height = h, .width = w,
             .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
             .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
-            .image_quality = 80,
+            .image_quality = s_jpeg_quality,
         };
         uint32_t out_len = 0;
         if (jpeg_encoder_process(g_jpeg, &jc, g_scratch_rgb, w * h * 2,
                                  g_jpeg_out, g_jpeg_out_sz, &out_len) == ESP_OK) {
-            if (g_http) g_http->push_jpeg(g_jpeg_out, out_len);
+            if (g_wifi_stream) g_wifi_stream->push_jpeg(g_jpeg_out, out_len);
+            if (g_http_eth)  g_http_eth->push_jpeg(g_jpeg_out, out_len);
         }
         xSemaphoreGive(g_scratch_lock);
     };
     ESP_ERROR_CHECK(app_video_register_frame_operation_cb(frame_cb));
     ESP_ERROR_CHECK(app_video_stream_task_start(cam_fd, 0));
 
-    ESP_LOGI(TAG, "Streaming at http://192.168.1.200:8080/");
+    ESP_LOGI(TAG, "Streaming: WiFi AP 'P4-FaceStream' at http://192.168.4.1:8080/");
+    if (p4fs::g_ethernet_stream_enabled.load())
+        ESP_LOGI(TAG, "  (Ethernet also active at http://192.168.1.200:8080/)");
     ESP_LOGI(TAG, "startup: free_heap=%u min_free=%u psram_free=%u",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size(),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+        int congestion = g_wifi_stream ? c5_sdio_get_tx_congestion_pct() : -1;
         ESP_LOGI(TAG, "alive frames=%u fps=%.1f enrolled=%d "
-                 "free_heap=%u psram_free=%u",
+                 "congest=%d%% free_heap=%u psram_free=%u",
                  (unsigned)s_fc, p4fs::g_cam_fps_x100 / 100.0f,
                  g_face_ai ? g_face_ai->num_enrolled() : -1,
+                 congestion,
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     }

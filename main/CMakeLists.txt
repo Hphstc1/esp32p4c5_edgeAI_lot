@@ -5,6 +5,7 @@ idf_component_register(
         "face_ai.cpp"
         "jpeg_annotate.cpp"
         "http_server.cpp"
+        "wifi_tcp_stream.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -18,6 +19,7 @@ idf_component_register(
         spiffs
         wt99p4c5_s1_board
         bsp_extra
+        c5_bridge
         espressif__esp_video
         espressif__esp_cam_sensor
         espressif__esp_sccb_intf
