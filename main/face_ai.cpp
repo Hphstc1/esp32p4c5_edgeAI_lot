@@ -39,32 +39,20 @@ bool FaceAi::init() {
     detector_ = new HumanFaceDetect();
     recognizer_ = new HumanFaceRecognizer(cfg_.db_path.c_str());
 
-    /* Apply user-configured score thresholds to the detector.
-     * cfg_.detect_min_score is 0..100; convert to 0.0..1.0.
-     * MSRMNP has two stages: idx=0 (MSR), idx=1 (MNP). */
+    /* Apply user-configured score threshold to the detector. */
     float thr = (float)cfg_.detect_min_score / 100.0f;
-    detector_->set_score_thr(thr, 0);  // MSR stage
-    detector_->set_score_thr(thr, 1);  // MNP stage
+    detector_->set_score_thr(thr);
 
-    /* Diagnostic: check if model was actually loaded and inspect quantization params */
-    auto *raw = detector_->get_raw_model(0);  // try to get MSR model
-    auto *raw2 = detector_->get_raw_model(1); // try to get MNP model
+    /* Diagnostic: log the loaded detection model input shape. */
+    auto *raw = detector_->get_raw_model();
     if (raw) {
         auto *inp = raw->get_input();
-        ESP_LOGI(TAG, "FaceAi: MSR input: [%d,%d,%d,%d] dtype=%d exponent=%d",
+        ESP_LOGI(TAG, "FaceAi: detect model input: [%d,%d,%d,%d] dtype=%d exponent=%d",
                  (int)inp->shape[0], (int)inp->shape[1], (int)inp->shape[2], (int)inp->shape[3],
                  (int)inp->dtype, (int)inp->exponent);
     }
-    if (raw2) {
-        auto *inp2 = raw2->get_input();
-        ESP_LOGI(TAG, "FaceAi: MNP input: [%d,%d,%d,%d] dtype=%d exponent=%d",
-                 (int)inp2->shape[0], (int)inp2->shape[1], (int)inp2->shape[2], (int)inp2->shape[3],
-                 (int)inp2->dtype, (int)inp2->exponent);
-    }
-    ESP_LOGI(TAG, "FaceAi ready, db=%s, enrolled=%d, detect_thr=%.2f, "
-             "msr_model=%p mnp_model=%p",
-             cfg_.db_path.c_str(), recognizer_->get_num_feats(), thr,
-             (void*)raw, (void*)raw2);
+    ESP_LOGI(TAG, "FaceAi ready, db=%s, enrolled=%d, detect_thr=%.2f, model=%p",
+             cfg_.db_path.c_str(), recognizer_->get_num_feats(), thr, (void*)raw);
     return true;
 }
 
@@ -119,7 +107,7 @@ std::vector<FaceHit> FaceAi::process(const uint8_t *rgb565, int width, int heigh
     auto det_results = detector_->run(img);
     frames_processed_++;
 
-    /* On very first run, check if model returned anything at all */
+    /* On very first run, log how many faces were found. */
     if (frames_processed_ == 1) {
         ESP_LOGI(TAG, "first detection: %zu results, thr=%.2f",
                  det_results.size(), (float)cfg_.detect_min_score / 100.0f);

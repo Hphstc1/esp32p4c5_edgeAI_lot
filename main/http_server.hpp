@@ -1,17 +1,16 @@
 /*
- * http_server: tiny blocking-friendly HTTP/1.1 server.
+ * http_server: esp_http_server-based dashboard + MJPEG stream.
  *
  * Endpoints
  *   GET  /            – dashboard HTML
  *   GET  /stream      – multipart/x-mixed-replace MJPEG
  *   GET  /api/info    – JSON: device info, FPS, enrollment count
  *   GET  /api/events  – JSON: latest recognition event (poll)
- *   POST /api/enroll  – trigger one-shot enrollment; returns new id or -1
+ *   POST /api/enroll  – trigger one-shot enrollment
  *   POST /api/delete  – drop the last enrolled face
  *
- * The MJPEG broadcast is pull-based: the camera task pushes JPEG frames
- * into a small ring buffer and the server task wakes the waiting
- * subscribers on every push.
+ * The MJPEG feed is shared: the camera task pushes JPEG frames into a single
+ * protected buffer and every /stream client copies from it independently.
  */
 #pragma once
 
@@ -21,7 +20,8 @@
 #include <vector>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_http_server.h"
 
 namespace p4fs {
 
@@ -30,12 +30,8 @@ class FaceAi;  // fwd
 struct HttpServerConfig {
     int  port            = 8080;
     int  max_clients     = 4;
-    int  jpeg_quality    = 80;
-    int  jpeg_buffer_max = 3;   // ring buffer depth
-};
-
-struct JpegFrame {
-    std::vector<uint8_t> data;
+    int  jpeg_quality    = 80;   // kept for app_main compatibility; not used here
+    int  jpeg_buffer_max = 3;    // kept for API compatibility; not used here
 };
 
 class HttpServer {
@@ -43,45 +39,43 @@ public:
     HttpServer(const HttpServerConfig &cfg, FaceAi *face_ai);
     ~HttpServer();
 
-    // Start the listener + worker task. Returns ESP_OK on success.
+    // Start the esp_http_server. Returns true on success.
     bool start();
 
-    // Stop and join the task. Safe to call once.
+    // Stop the server. Safe to call multiple times.
     void stop();
 
-    // Push a freshly-encoded JPEG. The oldest frame in the ring is dropped
-    // when the ring is full. Called from the camera task.
+    // Push a freshly-encoded JPEG. Called from the camera task.
     void push_jpeg(const uint8_t *data, size_t len);
 
-    // Connection handling helpers, return false if the connection died.
-    bool serve_client(int fd, char *req, int req_len);
-    bool spr_path(const char *method, const char *path);
-    bool serve_stream(int fd);
-    bool serve_root(int fd);
-    bool serve_info(int fd);
-    bool serve_events(int fd);
-    bool serve_enroll(int fd, const std::string &body);
-    bool serve_delete(int fd);
+    // URI handlers (invoked by the internal static C wrappers).
+    esp_err_t root_handler(httpd_req_t *req);
+    esp_err_t stream_handler(httpd_req_t *req);
+    esp_err_t stream_async(httpd_req_t *req);
+    esp_err_t info_handler(httpd_req_t *req);
+    esp_err_t events_handler(httpd_req_t *req);
+    esp_err_t enroll_handler(httpd_req_t *req);
+    esp_err_t delete_handler(httpd_req_t *req);
 
 private:
-    void run_loop();
-
-    static const char *kBoundary;
-    static const char *kIndexHtml;
-
     HttpServerConfig cfg_;
     FaceAi          *face_ai_ = nullptr;
 
-    int   listen_fd_ = -1;
-    bool  running_    = false;
-    TaskHandle_t task_ = nullptr;
+    httpd_handle_t   server_ = nullptr;
+    SemaphoreHandle_t lock_  = nullptr;
 
-    // Ring buffer of recent JPEGs.
-    JpegFrame   ring_[8];
-    int         ring_cap_ = 0;
-    int         ring_head_ = 0;   // next slot to overwrite
-    int         ring_fill_ = 0;   // current number of valid frames
-    std::atomic<uint32_t> push_seq_{0};   // monotonic, used to wake waiters
+    // Latest JPEG buffer, protected by lock_.
+    uint8_t *jpeg_buf_ = nullptr;
+    size_t   jpeg_len_ = 0;
+    size_t   jpeg_cap_ = 0;
+
+    std::atomic<uint32_t> seq_{0};   // increments on every push
+    std::atomic<bool>     running_{false};
+
+    // Async MJPEG stream worker pool.
+    static void start_stream_workers();
+    static void stream_worker_task(void *arg);
+    static esp_err_t queue_stream_request(httpd_req_t *req, HttpServer *server);
 };
 
 } // namespace p4fs

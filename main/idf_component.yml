@@ -5,3 +5,5 @@ dependencies:
   espressif/esp_jpeg: "1.*"
   espressif/human_face_recognition: "*"
   espressif/human_face_detect: "*"
+  espressif/esp_wifi_remote: "~1.6.0"
+  espressif/esp_hosted: "~2.11.3"

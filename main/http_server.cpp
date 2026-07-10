@@ -1,36 +1,53 @@
 /*
- * http_server implementation. See http_server.hpp for the endpoint list.
+ * http_server implementation based on esp_http_server.
  *
- * Architecture: the main accept loop runs in one FreeRTOS task ("http_srv").
- * Short-lived requests (GET /, API calls, POST actions) are served inline.
- * Long-lived MJPEG stream clients ("/stream") are handed off to dedicated
- * "http_str" tasks so the accept loop stays free for API requests.
+ * A single server instance serves both the WiFi SoftAP and Ethernet interfaces
+ * (it binds to INADDR_ANY via lwIP).  The camera task pushes freshly encoded
+ * JPEGs into a shared protected buffer; every /stream client copies from it
+ * and sends the frames as multipart/x-mixed-replace.
  */
 #include "http_server.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
+#include <string>
+#include <vector>
 
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "face_ai.hpp"
+
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
-#include "face_ai.hpp"
-
 namespace p4fs {
 
-const char *HttpServer::kBoundary = "p4fsframe";
+namespace {
 
-const char *HttpServer::kIndexHtml = R"HTML(
+/* Async stream worker pool: the /stream URI handler cannot block the single
+ * httpd thread, otherwise /api/info and /api/events stop being served.
+ * We hand the request off to a worker task that runs the (long) MJPEG loop. */
+struct AsyncStreamReq {
+    httpd_req_t *req;
+    HttpServer  *server;
+};
+
+constexpr int kStreamWorkers = 2;
+QueueHandle_t   s_stream_queue = nullptr;
+SemaphoreHandle_t s_stream_worker_ready = nullptr;
+TaskHandle_t    s_stream_worker_handles[kStreamWorkers] = { nullptr };
+
+} // namespace
+
+static const char *TAG = "http";
+static const char *kBoundary = "p4fsframe";
+
+static const char *kIndexHtml = R"HTML(
 <!doctype html>
 <html><head><meta charset="utf-8"><title>P4 Face Stream</title>
 <style>
@@ -67,12 +84,11 @@ async function poll() {
     const r = await fetch('/api/info'); const j = await r.json();
     document.getElementById('enr').textContent = j.enrolled;
     document.getElementById('fps').textContent = j.fps.toFixed(1);
-    // Display last enrollment result if present
     var le = document.getElementById('laster');
     if (j.last_enroll === -1) le.textContent = 'failed (no face?)';
     else if (j.last_enroll >= 1) le.textContent = 'ok, id=' + j.last_enroll;
     else if (j.last_enroll === 0) le.textContent = '-';
-    else le.textContent = '-';  // -2 = no attempt yet
+    else le.textContent = '-';
     apiOk = true;
     document.getElementById('status').textContent = '';
     const e = await fetch('/api/events'); const ej = await e.json();
@@ -91,7 +107,6 @@ async function act(op) {
     var r = await fetch('/api/' + op, {method:'POST'});
     var j = await r.json();
     if (op === 'enroll') {
-      // Poll /api/info until we get a result or timeout (3 s).
       st.textContent = 'Enroll: queued, waiting...';
       for (var i = 0; i < 10; i++) {
         await new Promise(function(resolve) { setTimeout(resolve, 300); });
@@ -119,85 +134,142 @@ poll();
 </body></html>
 )HTML";
 
-static const char *TAG = "http";
+/* Shared state exported by app_main.cpp (same namespace). */
+extern uint32_t       g_cam_fps_x100;
+extern std::atomic<int> g_last_enroll_id;
+extern std::atomic<int> g_enroll_pending;
 
-// -------- socket helpers -----------------------------------------------
-static int set_nonblock(int fd) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+// ---- Static C handlers that forward to the instance -------------------
+static esp_err_t root_hdl(httpd_req_t *req) {
+    return static_cast<HttpServer *>(req->user_ctx)->root_handler(req);
+}
+static esp_err_t stream_hdl(httpd_req_t *req) {
+    return static_cast<HttpServer *>(req->user_ctx)->stream_handler(req);
+}
+static esp_err_t info_hdl(httpd_req_t *req) {
+    return static_cast<HttpServer *>(req->user_ctx)->info_handler(req);
+}
+static esp_err_t events_hdl(httpd_req_t *req) {
+    return static_cast<HttpServer *>(req->user_ctx)->events_handler(req);
+}
+static esp_err_t enroll_hdl(httpd_req_t *req) {
+    return static_cast<HttpServer *>(req->user_ctx)->enroll_handler(req);
+}
+static esp_err_t delete_hdl(httpd_req_t *req) {
+    return static_cast<HttpServer *>(req->user_ctx)->delete_handler(req);
 }
 
-static int wall_write(int fd, const void *buf, int n) {
-    const uint8_t *p = (const uint8_t *)buf;
-    int sent = 0;
-    while (sent < n) {
-        int r = send(fd, p + sent, n - sent, MSG_NOSIGNAL);
-        if (r <= 0) {
-            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                vTaskDelay(pdMS_TO_TICKS(2));
-                continue;
-            }
-            return -1;
-        }
-        sent += r;
+HttpServer::HttpServer(const HttpServerConfig &cfg, FaceAi *face_ai)
+    : cfg_(cfg), face_ai_(face_ai) {
+    lock_ = xSemaphoreCreateMutex();
+}
+
+HttpServer::~HttpServer() {
+    stop();
+    if (lock_) {
+        vSemaphoreDelete(lock_);
+        lock_ = nullptr;
     }
-    return sent;
+    free(jpeg_buf_);
 }
 
-static bool write_str(int fd, const char *s) {
-    return wall_write(fd, s, (int)strlen(s)) >= 0;
-}
+bool HttpServer::start() {
+    if (running_.load() || server_) return true;
 
-// Snapshot of the latest JPEG for a new client. Returns false if no frame yet.
-bool HttpServer::serve_stream(int fd) {
-    char hdr[256];
-    int n = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=%s\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n\r\n", kBoundary);
-    if (wall_write(fd, hdr, n) < 0) return false;
+    start_stream_workers();
 
-    uint32_t last_seen = 0xFFFFFFFFu;
-    while (running_) {
-        // Wait for a new frame.
-        uint32_t cur = push_seq_.load();
-        if (cur == last_seen) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        last_seen = cur;
-        // Snapshot the most recent frame (head-1).
-        if (ring_fill_ == 0) continue;
-        int idx = (ring_head_ - 1 + ring_cap_) % ring_cap_;
-        const JpegFrame &f = ring_[idx];
-        if (f.data.empty()) continue;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port        = cfg_.port;
+    config.max_open_sockets   = cfg_.max_clients;
+    config.lru_purge_enable   = true;
+    config.stack_size         = 20480;
 
-        int n2 = snprintf(hdr, sizeof(hdr),
-            "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-            kBoundary, (unsigned)f.data.size());
-        if (wall_write(fd, hdr, n2) < 0) return false;
-        if (wall_write(fd, f.data.data(), (int)f.data.size()) < 0) return false;
-        if (wall_write(fd, "\r\n", 2) < 0) return false;
+    if (httpd_start(&server_, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed");
+        return false;
     }
+
+    httpd_uri_t root_uri   = { "/",       HTTP_GET,  root_hdl,   this };
+    httpd_uri_t stream_uri = { "/stream", HTTP_GET,  stream_hdl, this };
+    httpd_uri_t info_uri   = { "/api/info",   HTTP_GET,  info_hdl,   this };
+    httpd_uri_t events_uri = { "/api/events", HTTP_GET,  events_hdl, this };
+    httpd_uri_t enroll_uri = { "/api/enroll", HTTP_POST, enroll_hdl, this };
+    httpd_uri_t delete_uri = { "/api/delete", HTTP_POST, delete_hdl, this };
+
+    httpd_register_uri_handler(server_, &root_uri);
+    httpd_register_uri_handler(server_, &stream_uri);
+    httpd_register_uri_handler(server_, &info_uri);
+    httpd_register_uri_handler(server_, &events_uri);
+    httpd_register_uri_handler(server_, &enroll_uri);
+    httpd_register_uri_handler(server_, &delete_uri);
+
+    ESP_LOGI(TAG, "HTTP server started on port %d", cfg_.port);
+    running_.store(true);
     return true;
 }
 
-bool HttpServer::serve_root(int fd) {
-    char hdr[128];
-    int n = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
-        "Content-Length: %u\r\nConnection: close\r\n\r\n",
-        (unsigned)strlen(kIndexHtml));
-    return wall_write(fd, hdr, n) >= 0 &&
-           wall_write(fd, kIndexHtml, (int)strlen(kIndexHtml)) >= 0;
+void HttpServer::stop() {
+    if (server_) {
+        httpd_stop(server_);
+        server_ = nullptr;
+    }
+    running_.store(false);
 }
 
-bool HttpServer::serve_info(int fd) {
-    extern uint32_t g_cam_fps_x100;       // defined in app_main.cpp
-    extern std::atomic<int> g_last_enroll_id;  // defined in app_main.cpp
+esp_err_t HttpServer::root_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, kIndexHtml, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t HttpServer::stream_handler(httpd_req_t *req) {
+    /* /stream cannot block the single httpd thread; hand it to a worker task. */
+    return queue_stream_request(req, this);
+}
+
+esp_err_t HttpServer::stream_async(httpd_req_t *req) {
+    httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=p4fsframe");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+
+    char hdr[256];
+    std::vector<uint8_t> local;
+    uint32_t last_seq = 0;
+
+    while (running_.load()) {
+        uint32_t cur_seq = seq_.load();
+        if (cur_seq == last_seq) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        last_seq = cur_seq;
+
+        if (xSemaphoreTake(lock_, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        if (jpeg_len_) {
+            local.assign(jpeg_buf_, jpeg_buf_ + jpeg_len_);
+        } else {
+            local.clear();
+        }
+        xSemaphoreGive(lock_);
+
+        if (local.empty()) continue;
+
+        int n = snprintf(hdr, sizeof(hdr),
+            "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+            kBoundary, (unsigned)local.size());
+        if (httpd_resp_send_chunk(req, hdr, n) != ESP_OK) break;
+        if (httpd_resp_send_chunk(req, (const char *)local.data(), local.size()) != ESP_OK) break;
+        if (httpd_resp_send_chunk(req, "\r\n", 2) != ESP_OK) break;
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    httpd_resp_sendstr_chunk(req, nullptr);
+    return ESP_OK;
+}
+
+esp_err_t HttpServer::info_handler(httpd_req_t *req) {
     int last_id = g_last_enroll_id.load();
-    char body[384];
+    char body[512];
     int n = snprintf(body, sizeof(body),
         "{\"device\":\"p4_face_stream\",\"chip\":\"ESP32-P4\","
         "\"enrolled\":%d,\"frames\":%u,\"frames_with_face\":%u,"
@@ -210,195 +282,141 @@ bool HttpServer::serve_info(int fd) {
         (unsigned long long)(esp_timer_get_time() / 1000000ULL),
         (unsigned)esp_get_free_heap_size(),
         last_id);
-    char hdr[128];
-    int hn = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: %u\r\nConnection: close\r\n\r\n",
-        (unsigned)n);
-    return wall_write(fd, hdr, hn) >= 0 && wall_write(fd, body, n) >= 0;
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        ESP_LOGW(TAG, "info response truncated (need %d, have %u)", n, (unsigned)sizeof(body));
+        n = (int)sizeof(body) - 1;
+        body[n] = '\0';
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, body, n);
+    return ESP_OK;
 }
 
-bool HttpServer::serve_events(int fd) {
+esp_err_t HttpServer::events_handler(httpd_req_t *req) {
     const std::string ev = face_ai_ ? face_ai_->last_event_json() : std::string("{}");
-    // Ensure we always emit valid JSON even if no face has been seen yet.
     const char *body = ev.empty() ? "{}" : ev.c_str();
-    int n = (int)strlen(body);
-    char hdr[128];
-    int hn = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)n);
-    return wall_write(fd, hdr, hn) >= 0 && wall_write(fd, body, n) >= 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
-bool HttpServer::serve_enroll(int fd, const std::string &body) {
-    (void)body;
-    // The actual enroll happens in app_main.cpp via a flag: the camera task
-    // sees the flag on the next frame, runs enroll_largest, clears it. Here
-    // we just acknowledge.
-    extern std::atomic<int> g_enroll_pending;
+esp_err_t HttpServer::enroll_handler(httpd_req_t *req) {
+    (void)req;
     g_enroll_pending.store(1);
     const char *resp = "{\"status\":\"queued\"}";
-    char hdr[256];
-    int hn = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: %u\r\nConnection: close\r\n\r\n",
-        (unsigned)strlen(resp));
-    return wall_write(fd, hdr, hn) >= 0 && write_str(fd, resp);
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
-bool HttpServer::serve_delete(int fd) {
+esp_err_t HttpServer::delete_handler(httpd_req_t *req) {
     int rc = face_ai_ ? face_ai_->delete_last() : -1;
     char body[64];
     int n = snprintf(body, sizeof(body), "{\"ok\":%s}", rc == 0 ? "true" : "false");
-    char hdr[128];
-    int hn = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)n);
-    return wall_write(fd, hdr, hn) >= 0 && wall_write(fd, body, n) >= 0;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, body, n);
+    return ESP_OK;
 }
 
-// SPR: true if this request should be served in a background task (long-lived).
-bool HttpServer::spr_path(const char *method, const char *path) {
-    return (!strcmp(method, "GET") && !strcmp(path, "/stream"));
-}
+/* ---- Async MJPEG stream worker pool -------------------------------- */
 
-bool HttpServer::serve_client(int fd, char *req, int req_len) {
-    // Trim CRLF and isolate the request line.
-    char *line_end = (char *)memchr(req, '\r', req_len);
-    if (!line_end) line_end = (char *)memchr(req, '\n', req_len);
-    if (!line_end) return false;
-    *line_end = 0;
-
-    char method[8] = {0}, path[64] = {0};
-    if (sscanf(req, "%7s %63s", method, path) != 2) return false;
-    ESP_LOGI(TAG, "%s %s", method, path);
-
-    if (!strcmp(method, "GET") && !strcmp(path, "/"))         return serve_root(fd);
-    if (!strcmp(method, "GET") && !strcmp(path, "/stream"))  return serve_stream(fd);
-    if (!strcmp(method, "GET") && !strcmp(path, "/api/info"))    return serve_info(fd);
-    if (!strcmp(method, "GET") && !strcmp(path, "/api/events"))  return serve_events(fd);
-    if (!strcmp(method, "POST") && !strcmp(path, "/api/enroll")) return serve_enroll(fd, "");
-    if (!strcmp(method, "POST") && !strcmp(path, "/api/delete")) return serve_delete(fd);
-
-    const char *resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-    return write_str(fd, resp);
-}
-
-// Per-stream-client task data. Freed by the task when the stream ends.
-struct StreamTaskCtx {
-    HttpServer *self;
-    int fd;
-};
-
-static void stream_task(void *arg) {
-    auto *ctx = static_cast<StreamTaskCtx *>(arg);
-    ctx->self->serve_stream(ctx->fd);
-    close(ctx->fd);
-    delete ctx;
-    vTaskDelete(nullptr);
-}
-
-void HttpServer::run_loop() {
-    ring_cap_ = cfg_.jpeg_buffer_max;
-    if (ring_cap_ < 1) ring_cap_ = 1;
-    if (ring_cap_ > (int)(sizeof(ring_)/sizeof(ring_[0]))) ring_cap_ = sizeof(ring_)/sizeof(ring_[0]);
-
-    char req[1024];
-    while (running_) {
-        struct sockaddr_in cli;
-        socklen_t cl = sizeof(cli);
-        int c = accept(listen_fd_, (struct sockaddr *)&cli, &cl);
-        if (c < 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        ESP_LOGI(TAG, "client %s:%d fd=%d",
-                 inet_ntoa(cli.sin_addr), ntohs(cli.sin_port), c);
-        int n = recv(c, req, sizeof(req) - 1, 0);
-        if (n > 0) {
-            req[n] = 0;
-
-            // Check whether this is a long-lived stream request BEFORE serving.
-            // We peek at the request line so we can decide routing strategy.
-            char req_copy[1024];
-            memcpy(req_copy, req, n + 1);
-            char *le = (char *)memchr(req_copy, '\r', n);
-            if (!le) le = (char *)memchr(req_copy, '\n', n);
-            if (le) *le = 0;
-            char m[8] = {0}, p[64] = {0};
-            if (sscanf(req_copy, "%7s %63s", m, p) == 2 && spr_path(m, p)) {
-                // Long-lived stream: hand off to a dedicated task so the
-                // main accept loop stays free for API requests.
-                auto *ctx = new StreamTaskCtx{this, c};
-                if (xTaskCreatePinnedToCore(stream_task, "http_str",
-                                            4096, ctx, 2, nullptr, 1) != pdPASS) {
-                    close(c);
-                    delete ctx;
-                }
-            } else {
-                serve_client(c, req, n);
-                close(c);
+void HttpServer::stream_worker_task(void *arg) {
+    (void)arg;
+    ESP_LOGI(TAG, "stream worker started");
+    while (true) {
+        xSemaphoreGive(s_stream_worker_ready);
+        AsyncStreamReq async_req;
+        if (xQueueReceive(s_stream_queue, &async_req, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "stream worker serving client");
+            async_req.server->stream_async(async_req.req);
+            if (httpd_req_async_handler_complete(async_req.req) != ESP_OK) {
+                ESP_LOGE(TAG, "stream async complete failed");
             }
-        } else {
-            close(c);
+            ESP_LOGI(TAG, "stream worker client done");
         }
     }
-    running_ = false;
-    vTaskDelete(nullptr);
 }
 
-HttpServer::HttpServer(const HttpServerConfig &cfg, FaceAi *face_ai)
-    : cfg_(cfg), face_ai_(face_ai) {}
+void HttpServer::start_stream_workers() {
+    if (s_stream_queue) return;   // already started
 
-HttpServer::~HttpServer() { stop(); }
+    s_stream_worker_ready = xSemaphoreCreateCounting(kStreamWorkers, 0);
+    s_stream_queue = xQueueCreate(kStreamWorkers, sizeof(AsyncStreamReq));
+    if (!s_stream_worker_ready || !s_stream_queue) {
+        ESP_LOGE(TAG, "failed to create stream worker queue/semaphore");
+        return;
+    }
 
-bool HttpServer::start() {
-    if (running_) return true;
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) { ESP_LOGE(TAG, "socket: %d", errno); return false; }
-    int yes = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in a = {};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = htons(cfg_.port);
-    if (bind(listen_fd_, (struct sockaddr *)&a, sizeof(a)) < 0) {
-        ESP_LOGE(TAG, "bind: %d", errno); close(listen_fd_); listen_fd_ = -1; return false;
+    for (int i = 0; i < kStreamWorkers; i++) {
+        if (!xTaskCreate(stream_worker_task, "stream_worker", 16384, nullptr, 5,
+                         &s_stream_worker_handles[i])) {
+            ESP_LOGE(TAG, "failed to create stream worker %d", i);
+        }
     }
-    if (listen(listen_fd_, cfg_.max_clients) < 0) {
-        ESP_LOGE(TAG, "listen: %d", errno); close(listen_fd_); listen_fd_ = -1; return false;
-    }
-    set_nonblock(listen_fd_);
-    running_ = true;
-    if (xTaskCreatePinnedToCore(
-            [](void *self) { static_cast<HttpServer *>(self)->run_loop(); },
-            "http_srv", 6144, this, 4, &task_, 1) != pdPASS) {
-        running_ = false;
-        close(listen_fd_); listen_fd_ = -1;
-        return false;
-    }
-    ESP_LOGI(TAG, "listening on :%d (max=%d)", cfg_.port, cfg_.max_clients);
-    return true;
 }
 
-void HttpServer::stop() {
-    if (!running_) return;
-    running_ = false;
-    if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
-    // task self-deletes once it observes running_==false
+esp_err_t HttpServer::queue_stream_request(httpd_req_t *req, HttpServer *server) {
+    httpd_req_t *copy = nullptr;
+    if (httpd_req_async_handler_begin(req, &copy) != ESP_OK) {
+        ESP_LOGE(TAG, "stream async begin failed");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "stream async begin failed");
+        return ESP_OK;
+    }
+
+    AsyncStreamReq async_req = { copy, server };
+
+    if (xSemaphoreTake(s_stream_worker_ready, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "no stream workers available");
+        httpd_req_async_handler_complete(copy);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "no stream workers available");
+        return ESP_OK;
+    }
+
+    if (xQueueSend(s_stream_queue, &async_req, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "stream worker queue full");
+        httpd_req_async_handler_complete(copy);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "stream worker queue full");
+        return ESP_OK;
+    }
+
+    return ESP_OK;
 }
 
 void HttpServer::push_jpeg(const uint8_t *data, size_t len) {
-    if (!running_ || !data || len == 0 || ring_cap_ == 0) return;
-    JpegFrame &slot = ring_[ring_head_];
-    slot.data.assign(data, data + len);
-    ring_head_ = (ring_head_ + 1) % ring_cap_;
-    if (ring_fill_ < ring_cap_) ring_fill_++;
-    push_seq_.fetch_add(1);
+    if (!data || len == 0 || !lock_) return;
+
+    if (xSemaphoreTake(lock_, pdMS_TO_TICKS(10)) != pdTRUE) return;
+
+    if (len > jpeg_cap_) {
+        free(jpeg_buf_);
+        jpeg_cap_ = (len + 1023) & ~((size_t)1023);
+        jpeg_buf_ = (uint8_t *)heap_caps_malloc(jpeg_cap_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!jpeg_buf_) {
+            jpeg_buf_ = (uint8_t *)malloc(jpeg_cap_);
+            if (!jpeg_buf_) {
+                jpeg_cap_ = 0;
+                jpeg_len_ = 0;
+                xSemaphoreGive(lock_);
+                ESP_LOGE(TAG, "jpeg buf alloc failed for %u bytes", (unsigned)len);
+                return;
+            }
+            ESP_LOGW(TAG, "jpeg buf fallback to internal RAM (%u bytes)", (unsigned)jpeg_cap_);
+        }
+    }
+
+    std::memcpy(jpeg_buf_, data, len);
+    jpeg_len_ = len;
+    xSemaphoreGive(lock_);
+    seq_.fetch_add(1);
 }
 
 } // namespace p4fs
