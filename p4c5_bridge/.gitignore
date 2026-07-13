@@ -1,0 +1,22 @@
+# Python virtual environments
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Cloudflare tunnel binary and config
+cloudflared.exe
+config.yml
+
+# OMC state
+.omc/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Optional: model weights are large; uncomment if you prefer not to track them
+# best.pt
