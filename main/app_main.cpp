@@ -2,27 +2,27 @@
  * p4_face_stream: face recognition + MJPEG streaming on the WT99P4C5-S1.
  *
  * Data flow:
- *   OV5647 (MIPI-CSI)  ──►  V4L2 RGB565 frames  ──►  FaceAi (every Nth frame)
- *                                              \─►  draw::annotate_faces
- *                                              \─►  jpeg_encoder
- *                                              \─►  HttpServer.push_jpeg
- *                                                   │ lwIP (WiFi AP + Ethernet)
- *                                                   ▼
+ *   OV5647 (MIPI-CSI)  -->  V4L2 RGB565 frames  -->  FaceAi (every Nth frame)
+ *                                              \-->  draw::annotate_faces
+ *                                              \-->  jpeg_encoder
+ *                                              \-->  HttpServer.push_jpeg
+ *                                                   | lwIP (WiFi STA)
+ *                                                   V
  *                                              PC Browser
  *
- * WiFi AP: SSID "P4-FaceStream", password "12345678", IP 192.168.4.1
- * Ethernet: disabled for this wireless-only test build
+ * WiFi STA: credentials + target IP stored in NVS namespace "p4cfg".
+ * Serial console (UART0) commands: ssid, pass, target, save, reboot, status, help.
  *
  * Endpoints (port 8080)
  *   GET  /              dashboard HTML
  *   GET  /stream        multipart MJPEG with face boxes drawn
- *   GET  /api/info      device / FPS / enrollment JSON
+ *   GET  /api/info      device / FPS / enrollment / target_ip JSON
  *   GET  /api/events    latest recognition event JSON
  *   POST /api/enroll    trigger one-shot enrollment on next frame
  *   POST /api/delete    drop the last enrolled face
  */
 /* ---- WiFi / HTTP enable switch ---------------------------------- */
-#define WIFI_HTTP_ENABLE  1   // 置 1 开启 WiFi+HTTP, 置 0 关闭仅测推理
+#define WIFI_HTTP_ENABLE  1   // 1=enable WiFi+HTTP, 0=disable and test inference only
 
 #include <atomic>
 #include <chrono>
@@ -37,14 +37,18 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "driver/jpeg_encode.h"
 #include "esp_video_init.h"
 #include "esp_vfs_fat.h"
 #include "esp_spiffs.h"
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
+#include "lwip/ip4_addr.h"
 
 #include "bsp/esp-bsp.h"
 #include "app_video.h"
@@ -59,6 +63,23 @@ namespace p4fs {
 std::atomic<int>     g_enroll_pending{0};     // set by /api/enroll
 std::atomic<int>     g_last_enroll_id{-2};    // -2=no attempt, -1=failed, >=1=enrolled id
 uint32_t             g_cam_fps_x100 = 0;      // updated every second
+
+/* ---- Persistent configuration (NVS namespace "p4cfg") --------------- */
+constexpr char NVS_NS[]    = "p4cfg";
+constexpr char KEY_SSID[]  = "wifi_ssid";
+constexpr char KEY_PASS[]  = "wifi_pass";
+constexpr char KEY_TARGET[]= "target_ip";
+constexpr size_t SSID_MAX  = 32;
+constexpr size_t PASS_MAX  = 64;
+constexpr size_t IP_MAX    = 16;
+
+/* Hard-coded demo credentials: hph666 / He4496385 / 192.168.43.242.
+ * NVS values will override these only if they are non-empty. */
+char g_wifi_ssid[SSID_MAX + 1] = "hph666";
+char g_wifi_pass[PASS_MAX + 1] = "He4496385";
+char g_target_ip[IP_MAX]       = "192.168.43.242";
+char g_wifi_ip[IP_MAX]         = "0.0.0.0";
+std::atomic<bool>    g_wifi_connected{false};
 }
 
 /* ---- Camera + encoder + face-ai + HTTP handles ---------------------- */
@@ -77,36 +98,245 @@ static SemaphoreHandle_t g_scratch_lock = nullptr;
  * JPEG encoding. The annotator is cheap, so it runs on every frame. */
 static constexpr int kProcessEveryN = 3;
 
-/* ---- WiFi SoftAP via esp_wifi_remote / esp_hosted ------------------- */
-#if WIFI_HTTP_ENABLE
-static void wifi_init_softap(void) {
-    ESP_LOGI(TAG, "WiFi: initializing SoftAP ...");
+/* ---- NVS config helpers --------------------------------------------- */
+static void cfg_load(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(p4fs::NVS_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "NVS config namespace not found, using defaults");
+        return;
+    }
 
-    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
-    if (!ap_netif) {
-        ESP_LOGE(TAG, "Failed to create default WiFi AP netif");
+    size_t len = 0;
+    if (nvs_get_str(h, p4fs::KEY_SSID, nullptr, &len) == ESP_OK && len > 1 && len <= sizeof(p4fs::g_wifi_ssid)) {
+        nvs_get_str(h, p4fs::KEY_SSID, p4fs::g_wifi_ssid, &len);
+    }
+    if (nvs_get_str(h, p4fs::KEY_PASS, nullptr, &len) == ESP_OK && len > 1 && len <= sizeof(p4fs::g_wifi_pass)) {
+        nvs_get_str(h, p4fs::KEY_PASS, p4fs::g_wifi_pass, &len);
+    }
+    if (nvs_get_str(h, p4fs::KEY_TARGET, nullptr, &len) == ESP_OK && len > 1 && len <= sizeof(p4fs::g_target_ip)) {
+        nvs_get_str(h, p4fs::KEY_TARGET, p4fs::g_target_ip, &len);
+    }
+
+    nvs_close(h);
+    ESP_LOGI(TAG, "NVS config loaded: ssid='%s' target_ip=%s",
+             p4fs::g_wifi_ssid, p4fs::g_target_ip);
+}
+
+static void cfg_save(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(p4fs::NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        printf("save: failed to open NVS namespace (%s)\r\n", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_ERROR_CHECK(nvs_set_str(h, p4fs::KEY_SSID,  p4fs::g_wifi_ssid));
+    ESP_ERROR_CHECK(nvs_set_str(h, p4fs::KEY_PASS,  p4fs::g_wifi_pass));
+    ESP_ERROR_CHECK(nvs_set_str(h, p4fs::KEY_TARGET, p4fs::g_target_ip));
+    err = nvs_commit(h);
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        printf("save: configuration saved to NVS\r\n");
+    } else {
+        printf("save: commit failed (%s)\r\n", esp_err_to_name(err));
+    }
+}
+
+/* ---- Serial console task -------------------------------------------- */
+static char *cmd_arg(char *line)
+{
+    char *p = strchr(line, ' ');
+    if (!p) return nullptr;
+    while (*p == ' ') ++p;
+    return (*p == '\0') ? nullptr : p;
+}
+
+static void serial_console_task(void *arg)
+{
+    (void)arg;
+    char line[128];
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    printf("\r\n");
+    printf("P4 console ready. Commands: ssid <n> | pass <p> | target <ip> | save | reboot | status | help\r\n");
+    if (p4fs::g_wifi_ssid[0] == '\0') {
+        printf("WARNING: no WiFi SSID configured. Use 'ssid' and 'pass', then 'save' + 'reboot'.\r\n");
+    }
+
+    while (true) {
+        printf("\r\nP4> ");
+        fflush(stdout);
+
+        /* Blocking line read: getchar() may return EOF when no data is ready,
+         * so we poll slowly and do NOT re-print the prompt until a line is
+         * complete. This avoids the P4> spam seen with fgets() on this console. */
+        int idx = 0;
+        bool got_any = false;
+        while (idx < (int)sizeof(line) - 1) {
+            int c = getchar();
+            if (c == EOF) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            got_any = true;
+            if (c == '\r' || c == '\n') {
+                break;
+            }
+            line[idx++] = (char)c;
+        }
+        line[idx] = '\0';
+
+        if (!got_any || line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "ssid ", 5) == 0) {
+            char *a = cmd_arg(line);
+            if (a) {
+                size_t len = strnlen(a, p4fs::SSID_MAX);
+                std::memcpy(p4fs::g_wifi_ssid, a, len);
+                p4fs::g_wifi_ssid[len] = '\0';
+                printf("ssid set to '%s' (not saved yet)\r\n", p4fs::g_wifi_ssid);
+            } else {
+                printf("usage: ssid <name>\r\n");
+            }
+        } else if (strncmp(line, "pass ", 5) == 0) {
+            char *a = cmd_arg(line);
+            if (a) {
+                size_t len = strnlen(a, p4fs::PASS_MAX);
+                std::memcpy(p4fs::g_wifi_pass, a, len);
+                p4fs::g_wifi_pass[len] = '\0';
+                printf("pass set (len=%zu, not saved yet)\r\n", strlen(p4fs::g_wifi_pass));
+            } else {
+                printf("usage: pass <password>\r\n");
+            }
+        } else if (strncmp(line, "target ", 7) == 0) {
+            char *a = cmd_arg(line);
+            if (a) {
+                size_t len = strnlen(a, p4fs::IP_MAX - 1);
+                std::memcpy(p4fs::g_target_ip, a, len);
+                p4fs::g_target_ip[len] = '\0';
+                printf("target_ip set to '%s' (not saved yet)\r\n", p4fs::g_target_ip);
+            } else {
+                printf("usage: target <ip>\r\n");
+            }
+        } else if (strcmp(line, "save") == 0) {
+            cfg_save();
+        } else if (strcmp(line, "reboot") == 0) {
+            printf("rebooting now...\r\n");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        } else if (strcmp(line, "status") == 0) {
+            printf("ssid:      %s\r\n", p4fs::g_wifi_ssid[0] ? p4fs::g_wifi_ssid : "(not set)");
+            printf("pass:      %s\r\n", p4fs::g_wifi_pass[0] ? "(set)" : "(not set)");
+            printf("target_ip: %s\r\n", p4fs::g_target_ip);
+            printf("wifi:      %s, ip=%s\r\n",
+                   p4fs::g_wifi_connected.load() ? "connected" : "disconnected",
+                   p4fs::g_wifi_ip);
+        } else if (strcmp(line, "help") == 0) {
+            printf("Commands:\r\n");
+            printf("  ssid <name>   set WiFi SSID (max %zu chars)\r\n", p4fs::SSID_MAX);
+            printf("  pass <pwd>    set WiFi password (max %zu chars)\r\n", p4fs::PASS_MAX);
+            printf("  target <ip>   set target IP, e.g. 192.168.43.100\r\n");
+            printf("  save          write config to NVS\r\n");
+            printf("  reboot        restart the device\r\n");
+            printf("  status        show current config and WiFi state\r\n");
+            printf("  help          show this message\r\n");
+        } else {
+            printf("unknown command '%s'. Type 'help'.\r\n", line);
+        }
+    }
+}
+
+/* ---- WiFi STA via esp_wifi_remote / esp_hosted ---------------------- */
+#if WIFI_HTTP_ENABLE
+static constexpr int WIFI_MAX_RETRY = 10;
+static int s_wifi_retry_num = 0;
+static esp_event_handler_instance_t s_wifi_event_hdl = nullptr;
+static esp_event_handler_instance_t s_ip_event_hdl = nullptr;
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    (void)arg;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi STA started, connecting ...");
+        esp_wifi_connect();
+        s_wifi_retry_num = 0;
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        p4fs::g_wifi_connected.store(false);
+        if (s_wifi_retry_num < WIFI_MAX_RETRY) {
+            ESP_LOGI(TAG, "WiFi disconnected, retry %d/%d", s_wifi_retry_num + 1, WIFI_MAX_RETRY);
+            esp_wifi_connect();
+            s_wifi_retry_num++;
+        } else {
+            ESP_LOGE(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        snprintf(p4fs::g_wifi_ip, sizeof(p4fs::g_wifi_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        p4fs::g_wifi_connected.store(true);
+        s_wifi_retry_num = 0;
+        ESP_LOGI(TAG, "WiFi connected, IP=%s", p4fs::g_wifi_ip);
+    }
+}
+
+static void wifi_init_sta(void)
+{
+    ESP_LOGI(TAG, "WiFi: initializing STA ...");
+
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        nullptr,
+                                                        &s_wifi_event_hdl));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        nullptr,
+                                                        &s_ip_event_hdl));
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    if (!sta_netif) {
+        ESP_LOGE(TAG, "Failed to create default WiFi STA netif");
         abort();
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    wifi_config_t ap_config = {};
-    const char *ssid = "P4-FaceStream";
-    const char *pass = "12345678";
-    strncpy((char *)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid) - 1);
-    ap_config.ap.ssid_len = (uint8_t)strlen(ssid);
-    strncpy((char *)ap_config.ap.password, pass, sizeof(ap_config.ap.password) - 1);
-    ap_config.ap.channel = 1;
-    ap_config.ap.max_connection = 4;
-    ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    if (p4fs::g_wifi_ssid[0] != '\0') {
+        wifi_config_t wifi_config = {};
+        size_t ssid_len = strnlen(p4fs::g_wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
+        std::memcpy(wifi_config.sta.ssid, p4fs::g_wifi_ssid, ssid_len);
+        wifi_config.sta.ssid[ssid_len] = '\0';
+        size_t pass_len = strnlen(p4fs::g_wifi_pass, sizeof(wifi_config.sta.password) - 1);
+        std::memcpy(wifi_config.sta.password, p4fs::g_wifi_pass, pass_len);
+        wifi_config.sta.password[pass_len] = '\0';
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-
-    ESP_LOGI(TAG, "WiFi SoftAP started: SSID=%s, IP=192.168.4.1", ssid);
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        ESP_LOGI(TAG, "WiFi STA started, SSID=%s", p4fs::g_wifi_ssid);
+    } else {
+        ESP_LOGW(TAG, "WiFi STA configured but SSID is empty; use serial console to set credentials, then save+reboot");
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
 }
 #endif  // WIFI_HTTP_ENABLE
 
@@ -118,6 +348,9 @@ extern "C" void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+
+    /* --- Load persistent configuration -------------------------- */
+    cfg_load();
 
     /* --- Storage: SPIFFS for the face DB ----------------------- */
     esp_vfs_spiffs_conf_t spiffs_cfg = {
@@ -134,6 +367,9 @@ extern "C" void app_main(void)
         esp_spiffs_info("storage", &total, &used);
         ESP_LOGI(TAG, "SPIFFS: total=%u used=%u", (unsigned)total, (unsigned)used);
     }
+
+    /* --- Serial configuration console -------------------------- */
+    xTaskCreate(serial_console_task, "serial_console", 4096, nullptr, 2, nullptr);
 
     /* --- Ethernet BSP init (kept for board-level power/clock setup) --
      * Make failure non-fatal: the wireless-only test path only needs the
@@ -168,9 +404,9 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(face_ai->init() ? ESP_OK : ESP_FAIL);
     g_face_ai = face_ai;
 
-    /* --- WiFi SoftAP via C5 SDIO (esp_wifi_remote + esp_hosted) */
+    /* --- WiFi STA via C5 SDIO (esp_wifi_remote + esp_hosted) */
 #if WIFI_HTTP_ENABLE
-    wifi_init_softap();
+    wifi_init_sta();
 #endif
 
     /* --- Unified HTTP server (port 8080, both WiFi and Ethernet) */
@@ -326,7 +562,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(app_video_register_frame_operation_cb(frame_cb));
     ESP_ERROR_CHECK(app_video_stream_task_start(cam_fd, 0));
 
-    ESP_LOGI(TAG, "Streaming: connect to AP 'P4-FaceStream' at http://192.168.4.1:8080/");
+    ESP_LOGI(TAG, "Streaming: device IP will be shown on WiFi connection; target IP=%s", p4fs::g_target_ip);
     ESP_LOGI(TAG, "startup: free_heap=%u min_free=%u psram_free=%u",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size(),

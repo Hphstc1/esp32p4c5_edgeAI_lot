@@ -138,6 +138,7 @@ poll();
 extern uint32_t       g_cam_fps_x100;
 extern std::atomic<int> g_last_enroll_id;
 extern std::atomic<int> g_enroll_pending;
+extern char           g_target_ip[];
 
 // ---- Static C handlers that forward to the instance -------------------
 static esp_err_t root_hdl(httpd_req_t *req) {
@@ -274,13 +275,14 @@ esp_err_t HttpServer::info_handler(httpd_req_t *req) {
         "{\"device\":\"p4_face_stream\",\"chip\":\"ESP32-P4\","
         "\"enrolled\":%d,\"frames\":%u,\"frames_with_face\":%u,"
         "\"fps\":%.2f,\"uptime_s\":%llu,\"heap_free\":%u,"
-        "\"last_enroll\":%d}",
+        "\"target_ip\":\"%s\",\"last_enroll\":%d}",
         face_ai_ ? (int)face_ai_->num_enrolled() : 0,
         face_ai_ ? (unsigned)face_ai_->frames_processed() : 0u,
         face_ai_ ? (unsigned)face_ai_->frames_with_face() : 0u,
         g_cam_fps_x100 / 100.0f,
         (unsigned long long)(esp_timer_get_time() / 1000000ULL),
         (unsigned)esp_get_free_heap_size(),
+        g_target_ip,
         last_id);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         ESP_LOGW(TAG, "info response truncated (need %d, have %u)", n, (unsigned)sizeof(body));
